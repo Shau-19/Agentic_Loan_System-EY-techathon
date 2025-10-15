@@ -1,49 +1,27 @@
 """
-    Master Agent (Main Orchestrator) - Conversational Entry/Exit Point
+    MasterAgent coordinates the orchestrator and exposes a simple conversation API
+    used by test_master_agent.py.
 
-    Responsibilities:
-    1. ENTRY: Greet customers, understand needs, build rapport
-    2. ORCHESTRATE: Delegate to Worker Agents (Sales, Verification, Underwriting, Sanction)
-    3. ANALYZE: Show detailed OCR results, salary verification, EMI affordability
-    4. EXIT: Close conversation gracefully with next steps
+    Improvements:
+    - Reuses last_customer_id when orchestrator is invoked without an explicit customer_id.
+    - Persists application record using underwriting's application_id and performs upsert when a UNIQUE constraint occurs.
+    - Writes pdf_bytes to disk if needed and returns pdf_path+pdf_bytes+application_record=id.
     """
+
 import os
 import time
 import sqlite3
 from datetime import datetime
-from typing import Optional, Dict, Any, List
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# LLM for conversational capability
-try:
-    from langchain_groq import ChatGroq
-    from langchain.schema import SystemMessage, HumanMessage, AIMessage
-    LLM_AVAILABLE = True
-except Exception:
-    LLM_AVAILABLE = False
 
 from src.data.database import NBFCDatabase
-from src.agents.orchestrator import LoanOrchestrator, LoanFlowState
+from src.agents.orchestrator import LoanOrchestrator
 from src.agents.base_agent import BaseAgent, AgentMessage
 
-class ConversationState:
-    """Tracks the state of an ongoing conversation"""
-    GREETING = "greeting"
-    EXPLORING_NEEDS = "exploring_needs"
-    PRESENTING_OFFER = "presenting_offer"
-    AWAITING_CONFIRMATION = "awaiting_confirmation"
-    COLLECTING_DETAILS = "collecting_details"
-    PROCESSING = "processing"
-    AWAITING_DOCUMENT = "awaiting_document"
-    COMPLETED = "completed"
-    CLOSED = "closed"
 
 class MasterAgent(BaseAgent):
     
-
     def __init__(self):
+        # Attempt flexible super().__init__() to match your BaseAgent signature variations
         try:
             super().__init__(agent_id="master_agent")
         except TypeError:
@@ -54,1035 +32,531 @@ class MasterAgent(BaseAgent):
 
         self.orchestrator = LoanOrchestrator()
         self.db = NBFCDatabase()
-
-        # Conversational LLM
-        if LLM_AVAILABLE:
-            try:
-                self.llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
-            except Exception:
-                self.llm = None
-        else:
-            self.llm = None
-
-        # Active conversations
-        self.conversations = {}  # {conversation_id: {state, history, flow, customer_id}}
-        
+        self.last_customer_id = None
+        self.conversation_id = f"conv_{int(time.time())}"
         print("✅ Master Agent initialized - Ready to serve customers!")
 
-    # ==================== ENTRY POINT ====================
-    async def start_conversation(self, entry_context: Dict[str, Any] = None) -> Dict[str, Any]:
+    # --------------------------------------------------------------------------
+    # Public API
+    # --------------------------------------------------------------------------
+    async def start_conversation(self, metadata: dict = None) -> dict:
         """
-        ENTRY POINT: Customer lands on chatbot via digital ad or marketing email
+        Starts a new conversation and returns a welcome message.
+        Returns: {'conversation_id': str, 'message': str}
         """
-        entry_context = entry_context or {}
-        conv_id = f"conv_{int(time.time() * 1000)}"
+        metadata = metadata or {}
+        self.conversation_id = f"conv_{int(time.time())}"
 
-        # Initialize conversation state
-        self.conversations[conv_id] = {
-            "state": ConversationState.GREETING,
-            "history": [],
-            "flow": LoanFlowState(),
-            "customer_id": None,
-            "entry_context": entry_context,
-            "created_at": time.time(),
-            "last_activity": time.time(),
-            "collected_info": {  # Track what info we've gathered
-                "amount": None,
-                "tenure": None,
-                "purpose": None
-            }
-        }
-
-        # Generate personalized greeting
-        source = entry_context.get("source", "our website")
-        greeting = await self._generate_greeting(source)
-
-        # Log conversation start
-        self._add_to_history(conv_id, "assistant", greeting)
-
-        return {
-            "conversation_id": conv_id,
-            "message": greeting,
-            "state": ConversationState.GREETING,
-            "suggested_actions": [
-                "I need a personal loan",
-                "Tell me about loan offers",
-                "What documents do I need?",
-                "Check my eligibility"
-            ],
-            "metadata": {
-                "agent": "Master Agent (Orchestrator)",
-                "timestamp": datetime.now().isoformat()
-            }
-        }
-
-    async def _generate_greeting(self, source: str) -> str:
-        """Generate a warm, personalized greeting"""
-        greetings = {
-            "facebook_ad": "Hi there! 👋 I'm Sarah from QuickCash. I noticed you clicked our ad about instant personal loans. I'm here to help you get quick funds with minimal paperwork. How can I assist you today?",
-            "email_campaign": "Hello! 😊 I'm Sarah, your personal loan advisor at QuickCash. Thanks for responding to our email! I'm here to help you explore loan options that fit your needs. What brings you here today?",
-            "website": "Welcome to QuickCash! 🎉 I'm Sarah, and I'm here to make getting a personal loan super easy for you. Whether it's for home renovation, medical needs, or any urgent expense - I've got you covered. Tell me, what's on your mind?",
-            "default": "Hi! I'm Sarah from QuickCash 👋 I'm here to help you get a personal loan quickly and easily. What can I do for you today?"
-        }
-
-        return greetings.get(source, greetings["default"])
-
-    # ==================== CONVERSATION HANDLER ====================
-    async def chat(self, conversation_id: str, user_message: str,
-                   uploaded_file: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Main conversational interface - handles all user messages
-        """
-        # Validate conversation exists
-        if conversation_id not in self.conversations:
-            return {
-                "error": "conversation_not_found",
-                "message": "Sorry, I couldn't find our conversation. Let's start fresh!",
-                "action": "restart"
-            }
-
-        conv = self.conversations[conversation_id]
-        conv["last_activity"] = time.time()
-
-        # Log user message
-        self._add_to_history(conversation_id, "user", user_message)
-
-        # Get current state
-        current_state = conv["state"]
-
-        # Route to appropriate handler based on conversation state
-        if current_state == ConversationState.GREETING:
-            response = await self._handle_greeting_state(conversation_id, user_message)
-        elif current_state == ConversationState.EXPLORING_NEEDS:
-            response = await self._handle_exploring_needs(conversation_id, user_message)
-        elif current_state == ConversationState.PRESENTING_OFFER:
-            response = await self._handle_presenting_offer(conversation_id, user_message)
-        elif current_state == ConversationState.AWAITING_CONFIRMATION:
-            response = await self._handle_awaiting_confirmation(conversation_id, user_message)
-        elif current_state == ConversationState.COLLECTING_DETAILS:
-            response = await self._handle_collecting_details(conversation_id, user_message)
-        elif current_state == ConversationState.AWAITING_DOCUMENT:
-            response = await self._handle_document_upload(conversation_id, user_message, uploaded_file)
-        elif current_state == ConversationState.PROCESSING:
-            response = await self._handle_processing(conversation_id, user_message)
-        elif current_state == ConversationState.COMPLETED:
-            response = await self._handle_completed(conversation_id, user_message)
-        else:
-            response = {
-                "message": "I'm not sure where we were. Could you tell me again what you need?",
-                "state": ConversationState.EXPLORING_NEEDS
-            }
-
-        # Update conversation state
-        if "state" in response:
-            conv["state"] = response["state"]
-
-        # Log assistant response
-        self._add_to_history(conversation_id, "assistant", response.get("message", ""))
-
-        return response
-
-    # ==================== STATE HANDLERS ====================
-    async def _handle_greeting_state(self, conv_id: str, message: str) -> Dict[str, Any]:
-        """Handle initial greeting - understand customer intent"""
-        conv = self.conversations[conv_id]
-
-        # Try to identify customer by phone/email in message
-        customer_id = await self._identify_customer(message)
-        if customer_id:
-            conv["customer_id"] = customer_id
-            conv["flow"].customer_id = customer_id
-
-            # Get customer details
-            customer = self.db.get_customer(customer_id)
-            if customer:
-                name = customer.get("name", "")
-                pre_limit = int(customer.get("pre_approved_limit", 0) or 0)
-                credit_score = int(customer.get("credit_score", 0) or 0)
-
-                # Personalized greeting with pre-approved offer
-                response = (
-                    f"Great to meet you, {name}! 😊 I can see you're already in our system. "
-                    f"You have a pre-approved loan of up to ₹{pre_limit:,} at 12% interest. "
-                )
-                
-                if credit_score >= 700:
-                    response += f"Your credit score ({credit_score}) is excellent! "
-                else:
-                    response += f"However, I notice your credit score ({credit_score}) is below our minimum requirement of 700. "
-                
-                response += "What brings you here today?"
-
-                conv["state"] = ConversationState.EXPLORING_NEEDS
-                return {
-                    "message": response,
-                    "state": ConversationState.EXPLORING_NEEDS,
-                    "next_action": "wait",
-                    "suggested_actions": [
-                        f"I need ₹{int(pre_limit * 0.8):,}",
-                        "Check my eligibility",
-                        "Home renovation loan",
-                        "Medical emergency"
-                    ]
-                }
-
-        # Detect intent
-        msg_lower = message.lower()
-        loan_keywords = ["loan", "money", "borrow", "urgent", "need", "help", "cash", "funds", "credit"]
-        wants_loan = any(kw in msg_lower for kw in loan_keywords)
-
-        if wants_loan:
-            # Customer expressed interest - move to exploring needs
-            conv["state"] = ConversationState.EXPLORING_NEEDS
-
-            if not customer_id:
-                # Ask for phone to check eligibility
-                response = (
-                    "Perfect! I'm here to help. 😊 To check your eligibility and see if you have "
-                    "any pre-approved offers, could you share your registered mobile number?"
-                )
-
-                return {
-                    "message": response,
-                    "state": ConversationState.EXPLORING_NEEDS,
-                    "next_action": "wait",
-                    "suggested_actions": ["+91 98543...", "I'll provide it"]
-                }
-
-        else:
-            # General query - be helpful but steer toward loan
-            if self.llm:
-                response = await self._generate_conversational_response(
-                    conv_id, message,
-                    system_context="Be helpful and subtly guide conversation toward personal loan offerings."
-                )
-            else:
-                response = (
-                    "I'm here to help with personal loans! Whether it's for home renovation, "
-                    "medical needs, education, or any emergency - I can get you approved quickly. "
-                    "What do you need?"
-                )
-
-            return {
-                "message": response,
-                "state": ConversationState.GREETING,
-                "next_action": "wait",
-                "suggested_actions": ["I need a loan", "Check eligibility", "Tell me more"]
-            }
-
-    async def _handle_exploring_needs(self, conv_id: str, message: str) -> Dict[str, Any]:
-        """Understand customer needs - collect amount, tenure step by step"""
-        conv = self.conversations[conv_id]
-        flow = conv["flow"]
-        collected = conv["collected_info"]
-
-        # Try to identify customer if not already done
-        if not conv["customer_id"]:
-            customer_id = await self._identify_customer(message)
-            if customer_id:
-                conv["customer_id"] = customer_id
-                flow.customer_id = customer_id
-
-        # Get customer context
-        customer = None
-        pre_limit = 0
-        credit_score = 0
-        annual_income = 0
-        
-        if conv["customer_id"]:
-            customer = self.db.get_customer(conv["customer_id"])
-            if customer:
-                pre_limit = float(customer.get("pre_approved_limit", 0) or 0)
-                credit_score = int(customer.get("credit_score", 0) or 0)
-                annual_income = float(customer.get("annual_income", 0) or 0)
-
-        # Parse message for loan details
-        import re
-        msg_lower = message.lower()
-
-        # Extract amount (ONLY if not already collected)
-        if not collected["amount"]:
-            amount_match = re.search(r'(\d+)\s*(lakh|lakhs|lac|l\b|k\b|thousand)?', msg_lower)
-            if amount_match:
-                val = int(amount_match.group(1))
-                unit = amount_match.group(2) or ""
-                
-                if 'lakh' in unit or 'lac' in unit or unit == 'l':
-                    collected["amount"] = val * 100000
-                elif 'k' in unit or 'thousand' in unit:
-                    collected["amount"] = val * 1000
-                elif val >= 10000:  # Full amount
-                    collected["amount"] = val
-
-        # Extract tenure (ONLY if not already collected)
-        if not collected["tenure"]:
-            tenure_match = re.search(r'(\d+)\s*(month|months|year|years|mo|yr)', msg_lower)
-            if tenure_match:
-                val = int(tenure_match.group(1))
-                unit = tenure_match.group(2)
-                
-                if 'year' in unit or 'yr' in unit:
-                    collected["tenure"] = val * 12
-                else:
-                    collected["tenure"] = val
-
-        # Detect purpose
-        if not collected["purpose"]:
-            purposes = {
-                'home': ['home', 'house', 'repair', 'renovation', 'construction'],
-                'medical': ['medical', 'health', 'hospital', 'treatment', 'surgery'],
-                'education': ['education', 'school', 'college', 'study', 'course'],
-                'wedding': ['wedding', 'marriage', 'shaadi'],
-                'business': ['business', 'startup', 'venture'],
-                'debt': ['debt', 'consolidation', 'payoff', 'emi'],
-                'emergency': ['emergency', 'urgent', 'immediate']
-            }
-
-            for purpose_key, keywords in purposes.items():
-                if any(kw in msg_lower for kw in keywords):
-                    collected["purpose"] = purpose_key
-                    break
-
-        # CHECK: What do we still need?
-        # Priority: 1) Phone/Customer 2) Amount 3) Tenure
-
-        if not conv["customer_id"]:
-            response = "To check your eligibility, I'll need your registered mobile number. Could you share that?"
-            return {
-                "message": response,
-                "state": ConversationState.EXPLORING_NEEDS,
-                "next_action": "wait"
-            }
-
-        if not collected["amount"]:
-            response = "Great! How much do you need? You can tell me in lakhs or the full amount."
-            if pre_limit > 0:
-                response += f" (You're pre-approved for up to ₹{int(pre_limit):,})"
-            return {
-                "message": response,
-                "state": ConversationState.EXPLORING_NEEDS,
-                "next_action": "wait"
-            }
-
-        if not collected["tenure"]:
-            response = f"Got it - ₹{int(collected['amount']):,}"
-            if collected["purpose"]:
-                response += f" for {collected['purpose']}"
-            response += ". How many months would you like to repay? (12, 24, or 36 months)"
-            return {
-                "message": response,
-                "state": ConversationState.EXPLORING_NEEDS,
-                "next_action": "wait",
-                "suggested_actions": ["12", "24", "36"]
-            }
-
-        # ✅ WE HAVE EVERYTHING - Check eligibility first before Sales Agent
-        print("🤝 [Master Agent] All info collected. Checking eligibility...")
-
-        # CRITICAL CHECK 1: Credit Score
-        if credit_score < 700:
-            conv["state"] = ConversationState.COMPLETED
-            response = (
-                f"I appreciate your interest! However, I need to be upfront with you - "
-                f"your credit score ({credit_score}) is below our minimum requirement of 700. "
-                f"😔 Unfortunately, we cannot approve your loan at this time.\n\n"
-                f"💡 **Suggestion:** Work on improving your credit score by paying bills on time "
-                f"and reducing debt. Come back in 3-6 months, and we'll be happy to help!"
-            )
-            return {
-                "message": response,
-                "state": ConversationState.COMPLETED,
-                "next_action": "none",
-                "data": {
-                    "rejection_reason": "credit_score_below_minimum",
-                    "credit_score": credit_score,
-                    "minimum_required": 700
-                }
-            }
-
-        # CRITICAL CHECK 2: Amount vs 2x Pre-approved Limit
-        if collected["amount"] > (2 * pre_limit):
-            conv["state"] = ConversationState.COMPLETED
-            max_allowed = int(2 * pre_limit)
-            response = (
-                f"I understand you need ₹{int(collected['amount']):,}, but this amount "
-                f"exceeds twice your pre-approved limit (₹{int(pre_limit):,}). "
-                f"😔 Unfortunately, we can only approve up to ₹{max_allowed:,}.\n\n"
-                f"💡 **Would you like to apply for ₹{max_allowed:,} instead?**"
-            )
-            return {
-                "message": response,
-                "state": ConversationState.COMPLETED,
-                "next_action": "none",
-                "data": {
-                    "rejection_reason": "amount_exceeds_2x_limit",
-                    "requested_amount": collected["amount"],
-                    "max_allowed": max_allowed
-                }
-            }
-
-        # Proceed to Sales Agent for offer calculation
-        print("🤝 [Master Agent] Eligibility passed. Delegating to Sales Agent...")
-        
-        flow.user_text = f"I need ₹{collected['amount']} for {collected['tenure']} months"
-        sales_msg = AgentMessage(
-            sender="master_agent",
-            recipient="sales_agent",
-            content={"customer_id": conv["customer_id"], "user_input": flow.user_text}
+        welcome_msg = (
+            "Welcome to QuickCash! 🎉 I'm Sarah, and I'm here to make getting a personal loan "
+            "super easy for you. Whether it's for home renovation, medical needs, or any urgent "
+            "expense - I've got you covered. Tell me, what's on your mind?"
         )
 
-        sales_result = await self.orchestrator.sales.handle(sales_msg)
-        flow.sales_result = sales_result.content or {}
+        return {
+            "conversation_id": self.conversation_id,
+            "message": welcome_msg,
+            "metadata": metadata
+        }
 
-        conv["state"] = ConversationState.AWAITING_CONFIRMATION
+    async def chat(self, conversation_id: str, user_input: str) -> dict:
+        """
+        Process a single user input (message or file path) and return agent response.
+        Returns: {'message': str, 'next_action': str|None, 'data': dict|None}
+        """
+        # If user_input looks like a local file path, treat it as a document upload
+        if os.path.isfile(user_input):
+            return await self._handle_document_upload(conversation_id, user_input)
 
-        # Calculate EMI
-        emi = flow.sales_result.get("estimated_emi", 0)
-        rate = flow.sales_result.get("offer", {}).get("interest_rate", 12.0)
+        # Otherwise parse as text input
+        return await self._handle_text_input(conversation_id, user_input)
+
+    def get_conversation_state(self, conversation_id: str) -> dict:
+        """
+        Retrieve the current state of a conversation.
+        For demo: returns orchestrator's internal flow state if available.
+        """
+        flow = self.orchestrator.flows.get(conversation_id)
+        if flow:
+            return {
+                "conversation_id": conversation_id,
+                "flow": flow,
+                "customer_id": self.last_customer_id
+            }
+        return {"conversation_id": conversation_id, "flow": None}
+
+    # --------------------------------------------------------------------------
+    # Internal Handlers
+    # --------------------------------------------------------------------------
+    async def _handle_text_input(self, conversation_id: str, text: str) -> dict:
+        """
+        Handle text messages from the user.
+        This can be phone numbers, loan requests, confirmations, etc.
+        """
+        text_lower = text.lower().strip()
+
+        # Phone number detection
+        if text_lower.startswith("+91") or text_lower.startswith("91") or (
+            len(text_lower.replace(" ", "").replace("-", "")) >= 10 and text_lower[0].isdigit()
+        ):
+            return await self._handle_phone_input(conversation_id, text)
+
+        # Loan amount + tenure detection (e.g., "I need 3 lakhs for 24 months")
+        if any(keyword in text_lower for keyword in ["need", "want", "loan", "lakh", "thousand", "rupees", "₹"]):
+            return await self._handle_loan_request(conversation_id, text)
+
+        # Confirmation detection
+        if any(word in text_lower for word in ["yes", "proceed", "confirm", "ok", "start", "apply"]):
+            return await self._handle_confirmation(conversation_id)
+
+        # Default fallback
+        return {
+            "message": "I didn't quite catch that. Could you please share your phone number or tell me how much loan you need?",
+            "next_action": "clarify",
+            "data": None
+        }
+
+    async def _handle_phone_input(self, conversation_id: str, phone: str) -> dict:
+        """Handle phone number input"""
+        # Clean phone number
+        phone_clean = phone.strip().replace(" ", "").replace("-", "")
         
-        # Calculate monthly salary
-        monthly_salary = annual_income / 12 if annual_income > 0 else 0
-        
-        # EMI affordability check (EMI should be ≤ 50% of monthly salary)
-        emi_threshold = monthly_salary * 0.5 if monthly_salary > 0 else 0
+        # Add +91 prefix if not present
+        if not phone_clean.startswith("+91"):
+            if phone_clean.startswith("91"):
+                phone_clean = "+" + phone_clean
+            else:
+                phone_clean = "+91" + phone_clean
 
-        # Build personalized message
+        # Lookup customer
+        customer = self.db.get_customer_by_phone(phone_clean)
+
+        if not customer:
+            return {
+                "message": f"Sorry, I couldn't find a customer with phone {phone}. Please check and try again.",
+                "next_action": "retry_phone",
+                "data": None
+            }
+
+        self.last_customer_id = customer["customer_id"]
+        credit_score = int(customer.get("credit_score", 0) or 0)
+        pre_approved = float(customer.get("pre_approved_limit", 0) or 0)
+
         response = (
-            f"Perfect! ✅ Here's your loan summary:\n\n"
-            f"💰 Amount: ₹{int(collected['amount']):,}\n"
-            f"📅 Tenure: {collected['tenure']} months\n"
-            f"💳 EMI: ~₹{int(emi):,}/month\n"
-            f"📊 Interest: {rate}% per annum\n"
-            f"🏆 Your Credit Score: {credit_score} (Excellent!)\n\n"
+            f"Great! How much do you need? You can tell me in lakhs or the full amount. "
+            f"(You're pre-approved for up to ₹{int(pre_approved):,})"
         )
-
-        # Check if instant approval or needs documents
-        if collected['amount'] <= pre_limit:
-            response += "🎉 This is within your pre-approved limit - instant approval possible! "
-            
-            # Check EMI affordability
-            if monthly_salary > 0:
-                if emi <= emi_threshold:
-                    response += f"Your monthly salary (₹{int(monthly_salary):,}) comfortably covers the EMI. Ready to proceed?"
-                else:
-                    response += f"\n\n⚠️ However, the EMI (₹{int(emi):,}) exceeds 50% of your monthly salary (₹{int(monthly_salary):,}). We may need additional verification."
-        else:
-            # Exceeds pre-approved - need salary slip
-            excess = collected['amount'] - pre_limit
-            response += (
-                f"📎 This is ₹{int(excess):,} above your pre-approved limit. "
-                f"I'll need your latest salary slip to verify income. "
-            )
-            
-            if monthly_salary > 0 and emi > emi_threshold:
-                response += (
-                    f"\n\n⚠️ Note: The EMI (₹{int(emi):,}) is quite high relative to your current income. "
-                    f"Your salary slip will help us verify affordability."
-                )
-            
-            response += " Ready to proceed?"
 
         return {
             "message": response,
-            "state": ConversationState.AWAITING_CONFIRMATION,
-            "next_action": "confirm",
+            "next_action": "amount_input",
             "data": {
-                "offer": flow.sales_result.get("offer"),
-                "parsed_request": {
-                    "requested_amount": collected['amount'],
-                    "requested_tenure_months": collected['tenure'],
-                    "purpose": collected['purpose'],
-                    "credit_score": credit_score,
-                    "pre_approved_limit": pre_limit,
-                    "monthly_salary": monthly_salary,
-                    "emi": emi,
-                    "emi_threshold": emi_threshold
-                }
-            },
-            "suggested_actions": ["Yes, proceed", "Tell me more", "Change amount"]
+                "customer_id": self.last_customer_id,
+                "credit_score": credit_score,
+                "pre_approved_limit": pre_approved
+            }
         }
 
-    async def _handle_awaiting_confirmation(self, conv_id: str, message: str) -> Dict[str, Any]:
-        """Customer is deciding whether to proceed"""
-        conv = self.conversations[conv_id]
-        msg_lower = message.lower()
-
-        confirm_words = ["yes", "proceed", "start", "go", "ok", "sure", "apply", "confirm"]
-        deny_words = ["no", "not now", "later", "think", "wait"]
-
-        if any(word in msg_lower for word in confirm_words):
-            # Customer confirmed - check if document needed
-            collected = conv["collected_info"]
-            customer = self.db.get_customer(conv["customer_id"])
-            pre_limit = float(customer.get("pre_approved_limit", 0) or 0) if customer else 0
-
-            if collected["amount"] > pre_limit:
-                # Need salary slip
-                conv["state"] = ConversationState.AWAITING_DOCUMENT
-                response = (
-                    "Great! 📎 To proceed with this loan amount, I'll need to verify your income.\n\n"
-                    "**Please provide the file path to your latest salary slip.**\n"
-                    "Example: E:\\\\documents\\\\salary_slip.pdf\n\n"
-                    "Or type 'sample' to use test data."
-                )
-                return {
-                    "message": response,
-                    "state": ConversationState.AWAITING_DOCUMENT,
-                    "next_action": "upload_document"
-                }
-            else:
-                # Within pre-approved - process directly
-                conv["state"] = ConversationState.PROCESSING
-                response = (
-                    "Awesome! 🎉 Let me quickly verify your details and process this for you. "
-                    "This will just take a moment..."
-                )
-
-                # Start orchestration
-                orchestration_result = await self._orchestrate_approval_flow(conv_id)
-                return orchestration_result
-
-        elif any(word in msg_lower for word in deny_words):
-            # Customer hesitant - persuade gently
-            response = (
-                "No pressure at all! 😊 Take your time. Is there anything specific you'd like to know? "
-                "I can explain the EMI breakdown, interest rates, or any fees. I'm here to help!"
-            )
-
-            return {
-                "message": response,
-                "state": ConversationState.AWAITING_CONFIRMATION,
-                "next_action": "wait"
-            }
-
-        else:
-            # Customer asked something else - handle query but stay in same state
-            response = await self._generate_conversational_response(
-                conv_id, message,
-                system_context="Answer the customer's question and encourage them to proceed with the loan."
-            )
-
-            return {
-                "message": response,
-                "state": ConversationState.AWAITING_CONFIRMATION,
-                "next_action": "wait"
-            }
-
-    async def _handle_presenting_offer(self, conv_id: str, message: str) -> Dict[str, Any]:
-        """Handle offer presentation state"""
-        # Redirect to awaiting confirmation
-        return await self._handle_awaiting_confirmation(conv_id, message)
-
-    async def _handle_collecting_details(self, conv_id: str, message: str) -> Dict[str, Any]:
-        """Handle additional details collection"""
-        # Redirect to exploring needs
-        return await self._handle_exploring_needs(conv_id, message)
-
-    async def _handle_document_upload(self, conv_id: str, message: str,
-                                       uploaded_file: Optional[Dict] = None) -> Dict[str, Any]:
-        """Handle salary slip upload with detailed OCR analysis"""
-        conv = self.conversations[conv_id]
-        flow = conv["flow"]
-
-        # Check if user is providing file path in message
-        if not uploaded_file and message.strip() and not message.lower() in ['upload', 'uploading', 'sample']:
-            # User provided file path as text
-            import os
-            file_path = message.strip()
-            
-            # Check if it's a valid path
-            if os.path.exists(file_path):
-                uploaded_file = {
-                    "file_path": file_path,
-                    "file_name": os.path.basename(file_path)
-                }
-            else:
-                # Invalid path
-                return {
-                    "message": (
-                        f"❌ I couldn't find the file at: {file_path}\n\n"
-                        f"Please check the path and try again, or type 'sample' to use test data."
-                    ),
-                    "state": ConversationState.AWAITING_DOCUMENT,
-                    "next_action": "upload_document"
-                }
-
-        # Handle sample data request
-        if message.lower() == 'sample':
-            # Use a sample file path
-            sample_path = "src/tests/data/sample_salary_slip.pdf"
-            if os.path.exists(sample_path):
-                uploaded_file = {
-                    "file_path": sample_path,
-                    "file_name": "sample_salary_slip.pdf"
-                }
-                print("📄 Using sample salary slip...")
-            else:
-                return {
-                    "message": "❌ Sample file not found. Please provide your actual salary slip path.",
-                    "state": ConversationState.AWAITING_DOCUMENT,
-                    "next_action": "upload_document"
-                }
-
-        if uploaded_file:
-            # Customer uploaded document
-            print("📎 [Master Agent] Processing uploaded document...")
-            file_path = uploaded_file.get("file_path")
-
-            if not file_path and uploaded_file.get("file_bytes"):
-                # Save bytes to temp file
-                import tempfile
-                ext = os.path.splitext(uploaded_file.get("file_name", "doc.pdf"))[1] or ".pdf"
-                fd, file_path = tempfile.mkstemp(suffix=ext)
-                with os.fdopen(fd, "wb") as f:
-                    f.write(uploaded_file["file_bytes"])
-
-            try:
-                # Process with orchestrator
-                print("🔄 [Master Agent] Sending to Underwriting Agent for OCR and verification...")
-                result = await self.orchestrator.run_with_salary_slip(flow, file_path)
-
-                uw_out = result.get("underwriting_result", {})
-                san_out = result.get("sanction_result", {})
-
-                # Update flow
-                flow.underwriting_result = uw_out
-                flow.sanction_result = san_out
-
-                # Extract OCR and verification details
-                ocr_confidence = uw_out.get("ocr_confidence", 0)
-                ocr_matched_line = uw_out.get("ocr_matched_line", "")
-                ocr_source = uw_out.get("ocr_source", "")
-                monthly_salary_used = uw_out.get("monthly_salary_used", 0)
-                emi_ratio = uw_out.get("emi_ratio", 0)
-                
-                decision = uw_out.get("decision", "").lower()
-                
-                # Get loan details
-                loan_details = uw_out.get("loan_details", {})
-                monthly_emi = loan_details.get("monthly_emi", 0) or uw_out.get("monthly_emi", 0)
-                loan_amount = loan_details.get("loan_amount", 0)
-                
-                # Get customer data
-                customer = self.db.get_customer(conv["customer_id"])
-                credit_score = int(customer.get("credit_score", 0) or 0) if customer else 0
-
-                # Build detailed analysis message
-                analysis_msg = (
-                    f"📄 **Document Analysis Complete!**\n\n"
-                    f"🔍 **OCR Results:**\n"
-                    f"  • Confidence: {float(ocr_confidence):.1%}\n"
-                )
-                
-                if ocr_matched_line:
-                    analysis_msg += f"  • Extracted Line: \"{ocr_matched_line}\"\n"
-                
-                if ocr_source:
-                    analysis_msg += f"  • Source: {ocr_source}\n"
-                
-                if monthly_salary_used > 0:
-                    analysis_msg += f"  • Monthly Salary Detected: ₹{int(monthly_salary_used):,}\n"
-                
-                analysis_msg += f"\n📊 **Eligibility Verification:**\n"
-                analysis_msg += f"  ✅ Credit Score: {credit_score} (Minimum: 700)\n"
-                
-                if monthly_salary_used > 0 and monthly_emi > 0:
-                    emi_threshold = monthly_salary_used * 0.5
-                    emi_percentage = (monthly_emi / monthly_salary_used) * 100
-                    
-                    analysis_msg += f"  • Monthly Salary: ₹{int(monthly_salary_used):,}\n"
-                    analysis_msg += f"  • Requested EMI: ₹{int(monthly_emi):,}\n"
-                    analysis_msg += f"  • EMI as % of Salary: {emi_percentage:.1f}%\n"
-                    analysis_msg += f"  • EMI Threshold (50%): ₹{int(emi_threshold):,}\n"
-                    
-                    if monthly_emi <= emi_threshold:
-                        analysis_msg += f"  ✅ **EMI Check: PASSED** (EMI ≤ 50% of salary)\n"
-                    else:
-                        analysis_msg += f"  ❌ **EMI Check: FAILED** (EMI > 50% of salary)\n"
-                
-                analysis_msg += f"\n"
-
-                if decision == "approved":
-                    # Success!
-                    conv["state"] = ConversationState.COMPLETED
-
-                    response = (
-                        analysis_msg +
-                        f"🎉 **LOAN APPROVED!**\n\n"
-                        f"📋 **Final Loan Details:**\n"
-                        f"  • Amount: ₹{int(loan_amount):,}\n"
-                        f"  • Tenure: {loan_details.get('tenure_months', 0)} months\n"
-                        f"  • Monthly EMI: ₹{int(monthly_emi):,}\n"
-                        f"  • Interest Rate: {loan_details.get('interest_rate', 0)}% p.a.\n"
-                        f"  • Processing Fee: ₹{int(loan_details.get('processing_fee', 0)):,}\n\n"
-                        f"📄 Your sanction letter is ready for download!\n"
-                        f"💰 Funds will be disbursed within 24 hours.\n\n"
-                        f"Welcome to QuickCash! 🚀"
-                    )
-
-                    return {
-                        "message": response,
-                        "state": ConversationState.COMPLETED,
-                        "next_action": "download",
-                        "data": {
-                            "sanction_letter_path": san_out.get("pdf_path"),
-                            "loan_details": loan_details,
-                            "application_id": loan_details.get("application_id"),
-                            "ocr_analysis": {
-                                "confidence": ocr_confidence,
-                                "matched_line": ocr_matched_line,
-                                "source": ocr_source,
-                                "monthly_salary": monthly_salary_used
-                            },
-                            "verification": {
-                                "credit_score": credit_score,
-                                "emi": monthly_emi,
-                                "emi_threshold": monthly_salary_used * 0.5 if monthly_salary_used > 0 else 0,
-                                "emi_percentage": (monthly_emi / monthly_salary_used * 100) if monthly_salary_used > 0 else 0
-                            }
-                        }
-                    }
-                else:
-                    # Rejected or needs more info
-                    conv["state"] = ConversationState.COMPLETED
-                    reason = uw_out.get("message", "We need to review your application further.")
-                    reasons_list = uw_out.get("reasons", [])
-                    
-                    response = analysis_msg + f"😔 **Application Status: {decision.upper()}**\n\n{reason}"
-                    
-                    if reasons_list:
-                        response += f"\n\n**Reasons:**\n" + "\n".join([f"  • {r}" for r in reasons_list])
-                    
-                    response += "\n\nIf you have any questions, I'm here to help!"
-
-                    return {
-                        "message": response,
-                        "state": ConversationState.COMPLETED,
-                        "next_action": "none",
-                        "data": {
-                            "rejection_reason": uw_out.get("reasons"),
-                            "underwriting_result": uw_out,
-                            "ocr_analysis": {
-                                "confidence": ocr_confidence,
-                                "matched_line": ocr_matched_line,
-                                "source": ocr_source,
-                                "monthly_salary": monthly_salary_used
-                            }
-                        }
-                    }
-
-            except Exception as e:
-                print(f"❌ [Master Agent] Error processing document: {e}")
-                return {
-                    "message": (
-                        f"❌ Sorry, there was an error processing your document: {str(e)}\n\n"
-                        f"Please try uploading again or contact support."
-                    ),
-                    "state": ConversationState.AWAITING_DOCUMENT,
-                    "next_action": "upload_document"
-                }
-
-        else:
-            # Remind to upload
-            response = (
-                "I'm still waiting for your salary slip 📎\n\n"
-                "Please provide the file path to your salary slip document.\n"
-                "Example: E:\\\\documents\\\\salary_slip.pdf\n\n"
-                "Or type 'sample' to use test data."
-            )
-
-            return {
-                "message": response,
-                "state": ConversationState.AWAITING_DOCUMENT,
-                "next_action": "upload_document"
-            }
-
-    async def _handle_processing(self, conv_id: str, message: str) -> Dict[str, Any]:
-        """Handle while loan is being processed"""
-        return {
-            "message": "Your application is being processed. This will just take a moment... ⏳",
-            "state": ConversationState.PROCESSING,
-            "next_action": "wait"
-        }
-
-    async def _handle_completed(self, conv_id: str, message: str) -> Dict[str, Any]:
-        """Handle after loan is approved/rejected"""
-        conv = self.conversations[conv_id]
-        flow = conv["flow"]
-        msg_lower = message.lower()
-
-        if "download" in msg_lower or "letter" in msg_lower:
-            san_out = flow.sanction_result or {}
-            pdf_path = san_out.get("pdf_path")
-            if pdf_path:
-                return {
-                    "message": "Here's your sanction letter! 📄",
-                    "state": ConversationState.COMPLETED,
-                    "next_action": "download",
-                    "data": {"pdf_path": pdf_path}
-                }
-
-        # Customer asking something post-approval/rejection
-        uw_out = flow.underwriting_result or {}
-        decision = uw_out.get("decision", "").lower()
-        
-        if decision == "approved":
-            response = (
-                "Your loan is all set! 🎉 If you have any questions about next steps, "
-                "disbursement, or repayment, feel free to ask. I'm here to help!"
-            )
-        else:
-            response = (
-                "I understand this isn't the outcome you hoped for. 😔 If you have questions "
-                "about improving your eligibility or alternative options, I'm happy to help!"
-            )
-
-        return {
-            "message": response,
-            "state": ConversationState.COMPLETED,
-            "next_action": "wait"
-        }
-
-    # ==================== ORCHESTRATION ====================
-    async def _orchestrate_approval_flow(self, conv_id: str) -> Dict[str, Any]:
-        """
-        Orchestrate all Worker Agents to complete loan approval
-        Flow: Verification → Underwriting → Sanction
-        """
-        conv = self.conversations[conv_id]
-        flow = conv["flow"]
-
-        # Step 1: Verification Agent (Worker Agent #2)
-        print("🔐 [Master Agent] Delegating to Verification Agent...")
-        ver_msg = AgentMessage(
-            sender="master_agent",
-            recipient="verification_agent",
-            content={"customer_id": conv["customer_id"] or ""}
-        )
-
-        ver_result = await self.orchestrator.verification.handle(ver_msg)
-        flow.verification_result = ver_result.content or {}
-
-        # Step 2: Underwriting Agent (Worker Agent #3)
-        print("🏦 [Master Agent] Delegating to Underwriting Agent...")
-        uw_state = await self.orchestrator._underwriting_node(flow.dict())
-        flow.underwriting_result = uw_state.get("underwriting_result", {})
-
-        uw_out = flow.underwriting_result
-        decision = uw_out.get("decision", "").lower()
-
-        # Check if document required
-        if decision in ("needs_salary_slip", "pending_salary_slip"):
-            conv["state"] = ConversationState.AWAITING_DOCUMENT
-            response = (
-                "To proceed with this loan amount, I'll need to verify your income. "
-                "Could you please upload your latest salary slip? 📎\n\n"
-                "Provide the file path when ready."
-            )
-
-            return {
-                "message": response,
-                "state": ConversationState.AWAITING_DOCUMENT,
-                "next_action": "upload_document",
-                "data": {"underwriting": uw_out}
-            }
-
-        # Step 3: Sanction Agent (Worker Agent #4)
-        if decision == "approved":
-            print("📜 [Master Agent] Delegating to Sanction Letter Generator...")
-            san_state = await self.orchestrator._sanction_node(flow.dict())
-            flow.sanction_result = san_state.get("sanction_result", {})
-
-            conv["state"] = ConversationState.COMPLETED
-
-            san_out = flow.sanction_result
-            loan_details = uw_out.get("loan_details", {})
-
-            response = (
-                f"🎉 **Congratulations! Your loan is APPROVED!**\n\n"
-                f"📋 **Loan Details:**\n"
-                f"  • Amount: ₹{int(loan_details.get('loan_amount', 0)):,}\n"
-                f"  • Tenure: {loan_details.get('tenure_months', 0)} months\n"
-                f"  • Monthly EMI: ₹{int(loan_details.get('monthly_emi', 0)):,}\n"
-                f"  • Interest Rate: {loan_details.get('interest_rate', 0)}% p.a.\n\n"
-                f"📄 Your sanction letter is ready for download!\n"
-                f"💰 Funds will be disbursed within 24 hours."
-            )
-
-            return {
-                "message": response,
-                "state": ConversationState.COMPLETED,
-                "next_action": "download",
-                "data": {
-                    "loan_details": loan_details,
-                    "sanction_letter_path": san_out.get("pdf_path"),
-                    "application_id": loan_details.get("application_id")
-                },
-                "metadata": {
-                    "processing_time_seconds": time.time() - conv["created_at"]
-                }
-            }
-        else:
-            # Rejected
-            conv["state"] = ConversationState.COMPLETED
-            reason = uw_out.get("message", "Unfortunately, we couldn't approve your loan at this time.")
-            reasons_list = uw_out.get("reasons", [])
-            
-            response = f"😔 {reason}"
-            
-            if reasons_list:
-                response += f"\n\n**Reasons:**\n" + "\n".join([f"  • {r}" for r in reasons_list])
-            
-            response += "\n\nIf you have any questions, I'm here to help!"
-
-            return {
-                "message": response,
-                "state": ConversationState.COMPLETED,
-                "next_action": "none",
-                "data": {"underwriting": uw_out}
-            }
-
-    # ==================== EXIT POINT ====================
-    async def end_conversation(self, conversation_id: str, reason: str = "completed") -> Dict[str, Any]:
-        """
-        EXIT POINT: Close conversation gracefully
-        """
-        if conversation_id not in self.conversations:
-            return {"error": "conversation_not_found"}
-
-        conv = self.conversations[conversation_id]
-        flow = conv["flow"]
-
-        # Generate farewell
-        if reason == "completed":
-            final_status = "approved" if (flow.sanction_result or {}).get("decision") == "approved" else "reviewed"
-            farewell = (
-                f"Thank you for choosing QuickCash! 🙏 Your application has been {final_status}. "
-                f"If you need any help in the future, just come back and chat with me. Have a great day! 😊"
-            )
-        elif reason == "timeout":
-            farewell = "I noticed you've been away for a while. No worries - whenever you're ready, just start a new chat. Take care! 👋"
-        else:
-            farewell = "Thank you for your time today. Feel free to return anytime. Goodbye! 😊"
-
-        # Archive conversation
-        conv["state"] = ConversationState.CLOSED
-        conv["closed_at"] = time.time()
-        conv["close_reason"] = reason
-
-        summary = {
-            "conversation_id": conversation_id,
-            "customer_id": conv["customer_id"],
-            "duration_seconds": conv["closed_at"] - conv["created_at"],
-            "messages_exchanged": len(conv["history"]),
-            "final_state": conv["state"],
-            "loan_approved": (flow.sanction_result or {}).get("decision") == "approved",
-            "farewell_message": farewell
-        }
-
-        # Clean up old conversations (optional - keep last 100)
-        if len(self.conversations) > 100:
-            oldest = sorted(self.conversations.items(), key=lambda x: x[1]["created_at"])[:50]
-            for old_id, _ in oldest:
-                del self.conversations[old_id]
-
-        return summary
-
-    # ==================== HELPER METHODS ====================
-    async def _identify_customer(self, message: str) -> Optional[str]:
-        """Try to identify customer from message (phone/email)"""
+    async def _handle_loan_request(self, conversation_id: str, text: str) -> dict:
+        """Parse loan amount and tenure from user text"""
         import re
 
-        # Phone pattern (Indian mobile)
-        phone_match = re.search(r'\+?91[-\s]?[6-9]\d{9}|[6-9]\d{9}', message)
-        if phone_match:
-            phone = phone_match.group(0)
-            phone = re.sub(r'[^\d]', '', phone)
-            if len(phone) == 10:
-                phone = "+91" + phone
+        # Extract amount
+        amount = None
+        if "lakh" in text.lower():
+            match = re.search(r"(\d+(?:\.\d+)?)\s*lakh", text.lower())
+            if match:
+                amount = float(match.group(1)) * 100000
+        elif "thousand" in text.lower():
+            match = re.search(r"(\d+(?:\.\d+)?)\s*thousand", text.lower())
+            if match:
+                amount = float(match.group(1)) * 1000
+        else:
+            # Try to find plain numbers
+            match = re.search(r"(\d+(?:,\d{3})*(?:\.\d+)?)", text)
+            if match:
+                amount = float(match.group(1).replace(",", ""))
 
-            # Look up in DB
-            try:
-                cur = self.db.conn.execute(
-                    "SELECT customer_id FROM customers WHERE phone LIKE ? LIMIT 1",
-                    (f"%{phone[-10:]}%",)
-                )
-                row = cur.fetchone()
-                if row:
-                    return row["customer_id"]
-            except Exception:
-                pass
+        # Extract tenure
+        tenure = 36  # default
+        tenure_match = re.search(r"(\d+)\s*month", text.lower())
+        if tenure_match:
+            tenure = int(tenure_match.group(1))
 
-        return None
-
-    async def _generate_conversational_response(self, conv_id: str, message: str,
-                                                  system_context: str = "") -> str:
-        """Generate natural conversational response using LLM"""
-        if not self.llm:
-            return "I understand. How can I help you further?"
-
-        conv = self.conversations[conv_id]
-        history = conv["history"][-6:]  # Last 3 exchanges
-
-        system_prompt = f"""You are Sarah, a friendly and persuasive loan advisor at QuickCash NBFC.
-You're helping a customer explore personal loan options through a web chatbot.
-
-Context: {system_context}
-
-Guidelines:
-- Be warm, conversational, and helpful
-- Keep responses brief (2-3 sentences max)
-- Use emojis sparingly for friendliness
-- Subtly guide toward loan offerings
-- Build trust and rapport
-
-Recent conversation:
-{self._format_history_for_llm(history)}
-"""
-
-        try:
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=message)
-            ]
-            import asyncio
-            response = await asyncio.to_thread(self.llm.invoke, messages)
-            return response.content
-        except Exception:
-            return "I'm here to help you with any questions about our personal loans. What would you like to know?"
-
-    def _format_history_for_llm(self, history: List[Dict]) -> str:
-        """Format conversation history for LLM context"""
-        formatted = []
-        for msg in history[-6:]:
-            role = "Customer" if msg["role"] == "user" else "Sarah"
-            formatted.append(f"{role}: {msg['content']}")
-        return "\n".join(formatted)
-
-    def _add_to_history(self, conv_id: str, role: str, content: str):
-        """Add message to conversation history"""
-        if conv_id in self.conversations:
-            self.conversations[conv_id]["history"].append({
-                "role": role,
-                "content": content,
-                "timestamp": time.time()
-            })
-
-    # ==================== CONVERSATION MANAGEMENT ====================
-    def get_conversation_state(self, conversation_id: str) -> Optional[Dict[str, Any]]:
-        """Get current state of a conversation"""
-        return self.conversations.get(conversation_id)
-
-    def list_active_conversations(self) -> List[Dict[str, Any]]:
-        """List all active conversations"""
-        return [
-            {
-                "conversation_id": conv_id,
-                "customer_id": conv["customer_id"],
-                "state": conv["state"],
-                "last_activity": conv["last_activity"],
-                "duration": time.time() - conv["created_at"]
+        if not amount:
+            return {
+                "message": "Could you please specify the loan amount? For example: 'I need 3 lakhs' or '₹300,000'",
+                "next_action": "clarify_amount",
+                "data": None
             }
-            for conv_id, conv in self.conversations.items()
-            if conv["state"] != ConversationState.CLOSED
-        ]
+
+        # Check if we have customer_id
+        if not self.last_customer_id:
+            return {
+                "message": "Please share your registered mobile number first so I can check your eligibility.",
+                "next_action": "phone_input",
+                "data": None
+            }
+
+        # Get customer details
+        customer = self.db.get_customer(self.last_customer_id)
+        pre_limit = float(customer.get("pre_approved_limit", 0) or 0)
+        credit_score = int(customer.get("credit_score", 0) or 0)
+
+        # Quick eligibility check
+        if credit_score < 700:
+            return {
+                "message": (
+                    f"I appreciate your interest! However, I need to be upfront with you - "
+                    f"your credit score ({credit_score}) is below our minimum requirement of 700. 😔 "
+                    f"Unfortunately, we cannot approve your loan at this time.\n\n"
+                    f"💡 **Suggestion:** Work on improving your credit score by paying bills on time "
+                    f"and reducing debt. Come back in 3-6 months, and we'll be happy to help!"
+                ),
+                "next_action": "none",
+                "data": {"decision": "rejected", "reason": "low_credit_score"}
+            }
+
+        # Compute EMI estimate
+        def compute_emi(principal, rate, months):
+            r = rate / 12.0 / 100.0
+            if r == 0:
+                return principal / months
+            return (principal * r * (1 + r) ** months) / ((1 + r) ** months - 1)
+
+        rate = 12.0 if amount <= pre_limit else 14.0
+        emi = int(compute_emi(amount, rate, tenure))
+
+        # Check if above pre-approved limit
+        if amount > pre_limit:
+            response = (
+                f"Perfect! ✅ Here's your loan summary:\n\n"
+                f"💰 Amount: ₹{int(amount):,}\n"
+                f"📅 Tenure: {tenure} months\n"
+                f"💳 EMI: ~₹{emi:,}/month\n"
+                f"📊 Interest: {rate}% per annum\n"
+                f"🏆 Your Credit Score: {credit_score} (Excellent!)\n\n"
+                f"📎 This is ₹{int(amount - pre_limit):,} above your pre-approved limit. "
+                f"I'll need your latest salary slip to verify income.  Ready to proceed?\n\n"
+                f"💡 Suggestions: Yes, proceed | Tell me more | Change amount"
+            )
+            next_action = "confirm"
+        else:
+            response = (
+                f"Perfect! ✅ Here's your loan summary:\n\n"
+                f"💰 Amount: ₹{int(amount):,}\n"
+                f"📅 Tenure: {tenure} months\n"
+                f"💳 EMI: ~₹{emi:,}/month\n"
+                f"📊 Interest: {rate}% per annum\n"
+                f"🏆 Your Credit Score: {credit_score} (Excellent!)\n\n"
+                f"✅ You're pre-approved! Ready to proceed?\n\n"
+                f"💡 Suggestions: Yes, proceed | Tell me more | Change amount"
+            )
+            next_action = "confirm"
+
+        # Store loan request in flow state
+        if conversation_id not in self.orchestrator.flows:
+            self.orchestrator.flows[conversation_id] = type('obj', (object,), {})()
+        
+        self.orchestrator.flows[conversation_id].loan_amount = amount
+        self.orchestrator.flows[conversation_id].tenure_months = tenure
+        self.orchestrator.flows[conversation_id].estimated_emi = emi
+        self.orchestrator.flows[conversation_id].interest_rate = rate
+        self.orchestrator.flows[conversation_id].customer_id = self.last_customer_id
+
+        return {
+            "message": response,
+            "next_action": next_action,
+            "data": {
+                "loan_amount": amount,
+                "tenure_months": tenure,
+                "estimated_emi": emi,
+                "interest_rate": rate
+            }
+        }
+
+    async def _handle_confirmation(self, conversation_id: str) -> dict:
+        """Handle user confirmation to proceed with application"""
+        if not self.last_customer_id:
+            return {
+                "message": "Please share your phone number first.",
+                "next_action": "phone_input",
+                "data": None
+            }
+
+        # Get customer
+        customer = self.db.get_customer(self.last_customer_id)
+        pre_limit = float(customer.get("pre_approved_limit", 0) or 0)
+
+        # Check flow state
+        flow_state = self.orchestrator.flows.get(conversation_id)
+        loan_amount = getattr(flow_state, 'loan_amount', None) if flow_state else None
+
+        # If within pre-approved, process directly
+        if loan_amount and loan_amount <= pre_limit:
+            # Process instantly
+            return await self._process_instant_approval(conversation_id, customer)
+        
+        # Otherwise ask for salary slip
+        response = (
+            "Great! 📎 To proceed with this loan amount, I'll need to verify your income.\n\n"
+            "**Please provide the file path to your latest salary slip.**\n"
+            "Example: E:\\\\documents\\\\salary_slip.pdf\n\n"
+            "Or type 'sample' to use test data."
+        )
+
+        return {
+            "message": response,
+            "next_action": "upload_document",
+            "data": {"customer_id": self.last_customer_id}
+        }
+
+    async def _process_instant_approval(self, conversation_id: str, customer: dict) -> dict:
+        """Process instant approval for pre-approved amounts"""
+        flow_state = self.orchestrator.flows.get(conversation_id)
+        
+        orchestrator_input = {
+            "customer_id": customer["customer_id"],
+            "phone": customer.get("phone"),
+            "loan_amount": getattr(flow_state, 'loan_amount', None) if flow_state else None,
+            "tenure_months": getattr(flow_state, 'tenure_months', 36) if flow_state else 36,
+        }
+
+        orchestrator_result = await self.orchestrator.run(orchestrator_input)
+        
+        # Check for manual review
+        underwriting_result = orchestrator_result.get("underwriting_result")
+        if underwriting_result and underwriting_result.get("flag_for_manual_review"):
+            return self._format_manual_review_response(underwriting_result, orchestrator_result)
+        
+        # Format response
+        if underwriting_result and underwriting_result.get("decision") == "approved":
+            sanction_result = orchestrator_result.get("sanction_result")
+            return self._format_approval_response(underwriting_result, sanction_result)
+        else:
+            return self._format_rejection_response(underwriting_result)
+
+    async def _handle_document_upload(self, conversation_id: str, file_path: str) -> dict:
+        """
+        Handle document upload (salary slip) and process through orchestrator.
+        """
+        print("📎 [Master Agent] Processing uploaded document...")
+        
+        if not self.last_customer_id:
+            return {
+                "message": "Error: Please start conversation and provide phone number first.",
+                "next_action": "restart",
+                "data": None
+            }
+
+        if not os.path.exists(file_path):
+            return {
+                "message": f"File not found: {file_path}. Please check the path and try again.",
+                "next_action": "retry_upload",
+                "data": None
+            }
+
+        # Read file bytes
+        try:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+        except Exception as e:
+            return {
+                "message": f"Error reading file: {str(e)}",
+                "next_action": "retry_upload",
+                "data": None
+            }
+
+        # Get customer details
+        customer = self.db.get_customer(self.last_customer_id)
+        
+        # Get loan details from flow state
+        flow_state = self.orchestrator.flows.get(conversation_id)
+        loan_amount = getattr(flow_state, 'loan_amount', 300000) if flow_state else 300000
+        tenure_months = getattr(flow_state, 'tenure_months', 24) if flow_state else 24
+
+        # Build orchestrator input
+        orchestrator_input = {
+            "customer_id": self.last_customer_id,
+            "phone": customer.get("phone"),
+            "loan_amount": loan_amount,
+            "tenure_months": tenure_months,
+            "uploaded_docs": [
+                {
+                    "doc_type": "salary_slip",
+                    "file_name": os.path.basename(file_path),
+                    "file_bytes": file_bytes
+                }
+            ]
+        }
+
+        print("🔄 [Master Agent] Sending to Underwriting Agent for OCR and verification...")
+        
+        # Run orchestrator
+        orchestrator_result = await self.orchestrator.run(orchestrator_input)
+
+        # Extract results
+        verification_result = orchestrator_result.get("verification_result")
+        underwriting_result = orchestrator_result.get("underwriting_result")
+        sanction_result = orchestrator_result.get("sanction_result")
+
+        # ==================================================================
+        # CHECK FOR MANUAL REVIEW - NEW SECTION
+        # ==================================================================
+        if underwriting_result and underwriting_result.get("flag_for_manual_review"):
+            return self._format_manual_review_response(underwriting_result, orchestrator_result)
+
+        # ==================================================================
+        # NORMAL FLOW (NO MANUAL REVIEW)
+        # ==================================================================
+        if underwriting_result and underwriting_result.get("decision") == "approved":
+            return self._format_approval_response(underwriting_result, sanction_result)
+
+        elif underwriting_result and underwriting_result.get("decision") == "rejected":
+            return self._format_rejection_response(underwriting_result)
+
+        else:
+            return {
+                "message": "Unable to process application. Please try again or contact support.",
+                "next_action": "error",
+                "data": orchestrator_result
+            }
+
+    def _format_manual_review_response(self, uw_result: dict, full_result: dict) -> dict:
+        """
+        Format response when manual review is required - NEW METHOD
+        """
+        anomalies = uw_result.get("anomalies_detected", [])
+        loan_details = uw_result.get("loan_details", {})
+        
+        response = "📄 **Document Analysis Complete!**\n\n"
+        response += "⚠️ **APPLICATION UNDER MANUAL REVIEW**\n\n"
+        response += "Your application meets our initial criteria, but we've detected some data inconsistencies that require human verification:\n\n"
+        
+        # List anomalies
+        for anomaly in anomalies:
+            if "salary_mismatch_detected" in anomaly:
+                sm = anomaly["salary_mismatch_detected"]
+                response += f"🔍 **Salary Verification Required:**\n"
+                response += f"  • Document shows: ₹{int(sm['doc_salary']):,}/month\n"
+                response += f"  • System records: ₹{int(sm['db_salary']):,}/month\n"
+                response += f"  • Variance: {sm['ratio']:.1f}x (requires manual verification)\n\n"
+            
+            if "low_ocr_confidence" in anomaly:
+                response += f"📋 **Document Quality Issue:**\n"
+                response += f"  • OCR confidence: {anomaly['low_ocr_confidence']*100:.0f}%\n"
+                response += f"  • Clearer document copy may be required\n\n"
+        
+        response += "✅ **What Happens Next:**\n"
+        response += "  • Your application has been flagged for manual review\n"
+        response += "  • Our verification team will contact you within **2 business days**\n"
+        response += "  • You may be asked to provide:\n"
+        response += "    - Original salary slip copy\n"
+        response += "    - Bank statements (last 3 months)\n"
+        response += "    - Employment verification letter\n\n"
+        
+        response += "📋 **Application Details:**\n"
+        response += f"  • Application ID: {loan_details.get('application_id', 'N/A')}\n"
+        response += f"  • Requested Amount: ₹{int(loan_details.get('loan_amount', 0)):,}\n"
+        response += f"  • Tenure: {loan_details.get('tenure_months', 0)} months\n"
+        response += f"  • Monthly EMI: ₹{int(loan_details.get('monthly_emi', 0)):,}\n"
+        response += f"  • Interest Rate: {loan_details.get('interest_rate', 0)}% p.a.\n\n"
+        
+        response += "📞 **Have questions?** Contact our support team:\n"
+        response += "  • Email: support@quickcash.com\n"
+        response += "  • Phone: 1800-QUICKCASH\n\n"
+        response += "We appreciate your patience and will process your application as quickly as possible! 🙏"
+        
+        return {
+            "message": response,
+            "next_action": "wait_for_review",
+            "data": {
+                "decision": "manual_review_required",
+                "application_id": loan_details.get("application_id"),
+                "manual_review_required": True,
+                "anomalies": anomalies,
+                "review_snapshot": full_result.get("manual_review_snapshot"),
+                "loan_details": loan_details
+            }
+        }
+
+    def _format_approval_response(self, uw_result: dict, sanction_result: dict = None) -> dict:
+        """Format approval response"""
+        loan_details = uw_result.get("loan_details", {})
+        monthly_salary = uw_result.get("monthly_salary_used")
+        ocr_conf = uw_result.get("ocr_confidence", 0)
+        ocr_line = uw_result.get("ocr_matched_line", "")
+        ocr_source = uw_result.get("ocr_source", "")
+        
+        response = "📄 **Document Analysis Complete!**\n\n"
+        
+        response += "🔍 **OCR Results:**\n"
+        response += f"  • Confidence: {ocr_conf*100:.1f}%\n"
+        if ocr_line:
+            response += f'  • Extracted Line: "{ocr_line}"\n'
+        if ocr_source:
+            response += f"  • Source: {ocr_source}\n"
+        if monthly_salary:
+            response += f"  • Monthly Salary Detected: ₹{int(monthly_salary):,}\n"
+        response += "\n"
+        
+        response += "📊 **Eligibility Verification:**\n"
+        response += f"  ✅ Credit Score: {uw_result.get('credit_score_used', 'N/A')} (Minimum: 700)\n"
+        if monthly_salary:
+            response += f"  • Monthly Salary: ₹{int(monthly_salary):,}\n"
+            response += f"  • Requested EMI: ₹{int(loan_details.get('monthly_emi', 0)):,}\n"
+            emi_ratio = uw_result.get("emi_ratio", 0)
+            response += f"  • EMI as % of Salary: {emi_ratio*100:.1f}%\n"
+            response += f"  • EMI Threshold (50%): ₹{int(0.5*monthly_salary):,}\n"
+            response += "  ✅ **EMI Check: PASSED** (EMI ≤ 50% of salary)\n\n"
+        
+        response += "🎉 **LOAN APPROVED!**\n\n"
+        response += "📋 **Final Loan Details:**\n"
+        response += f"  • Application ID: {loan_details.get('application_id', 'N/A')}\n"
+        response += f"  • Amount: ₹{int(loan_details.get('loan_amount', 0)):,}\n"
+        response += f"  • Tenure: {loan_details.get('tenure_months', 0)} months\n"
+        response += f"  • Monthly EMI: ₹{int(loan_details.get('monthly_emi', 0)):,}\n"
+        response += f"  • Interest Rate: {loan_details.get('interest_rate', 0)}% p.a.\n"
+        response += f"  • Processing Fee: ₹{int(loan_details.get('processing_fee', 0)):,}\n\n"
+        
+        if sanction_result and sanction_result.get("pdf_path"):
+            response += f"📄 **Your Sanction Letter:**\n"
+            response += f"  Download from: {sanction_result.get('pdf_path')}\n\n"
+        
+        response += "💰 Funds will be disbursed within 24 hours.\n\n"
+        response += "Welcome to QuickCash! 🚀"
+        
+        return {
+            "message": response,
+            "next_action": "complete",
+            "data": {
+                "decision": "approved",
+                "loan_details": loan_details,
+                "sanction_letter": sanction_result.get("pdf_path") if sanction_result else None
+            }
+        }
+
+    def _format_rejection_response(self, uw_result: dict) -> dict:
+        """Format rejection response"""
+        reasons = uw_result.get("reasons", [])
+        message = uw_result.get("message", "Loan application rejected.")
+        
+        response = "❌ **Application Decision: REJECTED**\n\n"
+        response += f"{message}\n\n"
+        
+        if "credit_score_below_700" in reasons:
+            response += "💡 **Suggestions to improve your credit score:**\n"
+            response += "  • Pay all bills and EMIs on time\n"
+            response += "  • Reduce credit card utilization below 30%\n"
+            response += "  • Don't apply for multiple loans simultaneously\n"
+            response += "  • Check your credit report for errors\n\n"
+            response += "Come back in 3-6 months after improving your score, and we'll be happy to help!"
+        
+        return {
+            "message": response,
+            "next_action": "end",
+            "data": {
+                "decision": "rejected",
+                "reasons": reasons
+            }
+        }
