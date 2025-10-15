@@ -1,0 +1,52 @@
+# Environment variables - NEVER COMMIT
+src/.env
+.env
+*.env
+!src/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+ey_2/
+.venv/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+nbfc_loan_system.db
+
+# Generated files
+generated_documents/
+manual_reviews/
+uploads/
+*.pdf
+!docs/*.pdf
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribution
+build/
+dist/
+*.egg-info/

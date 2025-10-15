@@ -1,0 +1,114 @@
+# =============================================================================
+# QuickCash NBFC - Python Dependencies
+# =============================================================================
+
+# Core Framework
+langchain==0.1.16
+langchain-core==0.1.45
+langchain-groq==0.1.3
+langgraph==0.2.16
+
+# LLM Provider
+groq==0.5.0
+
+# Environment Variables
+python-dotenv==1.0.1
+
+# Web Framework (Mock API)
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+pydantic==2.6.3
+pydantic-settings==2.2.1
+
+# OCR Dependencies
+pytesseract==0.3.10
+PyMuPDF==1.23.26
+Pillow==10.2.0
+
+# PDF Generation
+reportlab==4.1.0
+
+# HTTP Requests
+requests==2.31.0
+httpx==0.27.0
+
+# Data Validation & Type Hints
+typing-extensions==4.10.0
+
+# Async Support
+asyncio==3.4.3
+aiohttp==3.9.3
+
+# Utilities
+python-dateutil==2.8.2
+
+# Streamlit (UI)
+streamlit==1.31.1
+streamlit-chat==0.1.1
+
+# Optional: Enhanced Development
+# pytest==8.0.2
+# pytest-asyncio==0.23.5
+# black==24.2.0
+# flake8==7.0.0
+# mypy==1.8.0
+
+# =============================================================================
+# Installation Instructions
+# =============================================================================
+#
+# Basic Installation:
+# pip install -r requirements.txt
+#
+# Development Installation (with testing tools):
+# pip install -r requirements.txt pytest pytest-asyncio black flake8
+#
+# =============================================================================
+# System Dependencies (Install Separately)
+# =============================================================================
+#
+# Tesseract OCR (Required for document processing):
+#
+# Windows:
+#   Download from: https://github.com/UB-Mannheim/tesseract/wiki
+#   Or use: choco install tesseract (if you have Chocolatey)
+#
+# Linux (Ubuntu/Debian):
+#   sudo apt-get update
+#   sudo apt-get install tesseract-ocr tesseract-ocr-eng
+#
+# macOS:
+#   brew install tesseract
+#
+# =============================================================================
+# Python Version Requirement
+# =============================================================================
+#
+# Python 3.9 or higher required (LangGraph requires Python >= 3.9)
+# Tested on: Python 3.9, 3.10, 3.11, 3.12
+#
+# =============================================================================
+# Package Descriptions
+# =============================================================================
+#
+# langchain          - Core LangChain library for building LLM applications
+# langchain-core     - LangChain core abstractions and interfaces
+# langchain-groq     - Groq integration for LangChain
+# langgraph          - Build stateful, multi-actor applications (Orchestrator)
+# groq               - Official Groq Python client
+# python-dotenv      - Load environment variables from .env files
+# fastapi            - Modern web framework for building APIs
+# uvicorn            - ASGI server for FastAPI
+# pydantic           - Data validation using Python type annotations
+# pytesseract        - Python wrapper for Tesseract OCR
+# PyMuPDF            - PDF text extraction library
+# Pillow             - Python Imaging Library for image processing
+# reportlab          - PDF generation library
+# requests           - HTTP library for API calls
+# httpx              - Async HTTP client
+# streamlit          - Interactive web app framework for data apps
+# streamlit-chat     - Chat UI components for Streamlit
+# aiohttp            - Async HTTP client/server framework
+# python-dateutil    - Extensions to the standard datetime module
+#
+# =============================================================================
