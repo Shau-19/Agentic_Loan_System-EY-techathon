@@ -7,7 +7,6 @@
     3. ANALYZE: Show detailed OCR results, salary verification, EMI affordability
     4. EXIT: Close conversation gracefully with next steps
     """
-
 import os
 import time
 import sqlite3
@@ -42,7 +41,7 @@ class ConversationState:
     CLOSED = "closed"
 
 class MasterAgent(BaseAgent):
-   
+    
 
     def __init__(self):
         try:
@@ -511,7 +510,6 @@ class MasterAgent(BaseAgent):
         confirm_words = ["yes", "proceed", "start", "go", "ok", "sure", "apply", "confirm"]
         deny_words = ["no", "not now", "later", "think", "wait"]
 
-        # Check if user is confirming
         if any(word in msg_lower for word in confirm_words):
             # Customer confirmed - check if document needed
             collected = conv["collected_info"]
@@ -559,26 +557,15 @@ class MasterAgent(BaseAgent):
 
         else:
             # Customer asked something else - handle query but stay in same state
-            # Check if they're asking about rates/fees/etc
-            if any(word in msg_lower for word in ['rate', 'interest', 'fee', 'charge', 'cost', 'decrease', 'reduce', 'lower']):
-                response = (
-                    "I understand you'd like to discuss the interest rate. 😊 "
-                    "Our current offer of 12% p.a. is already competitive for your credit profile. "
-                    "However, if you proceed now, I can note your request and our team will review if we can offer a better rate. "
-                    "Should we proceed with the application?"
-                )
-            else:
-                # Use LLM for other queries
-                response = await self._generate_conversational_response(
-                    conv_id, message,
-                    system_context="Answer the customer's question and encourage them to proceed with the loan."
-                )
+            response = await self._generate_conversational_response(
+                conv_id, message,
+                system_context="Answer the customer's question and encourage them to proceed with the loan."
+            )
 
             return {
                 "message": response,
                 "state": ConversationState.AWAITING_CONFIRMATION,
-                "next_action": "confirm",
-                "suggested_actions": ["Yes, proceed", "Tell me more"]
+                "next_action": "wait"
             }
 
     async def _handle_presenting_offer(self, conv_id: str, message: str) -> Dict[str, Any]:
@@ -719,23 +706,16 @@ class MasterAgent(BaseAgent):
                     # Success!
                     conv["state"] = ConversationState.COMPLETED
 
-                    # Get the PDF path and convert to absolute
-                    pdf_path = san_out.get("pdf_path", "")
-                    if pdf_path and not os.path.isabs(pdf_path):
-                        pdf_path = os.path.abspath(pdf_path)
-
                     response = (
                         analysis_msg +
                         f"🎉 **LOAN APPROVED!**\n\n"
                         f"📋 **Final Loan Details:**\n"
-                        f"  • Application ID: {loan_details.get('application_id', 'N/A')}\n"
                         f"  • Amount: ₹{int(loan_amount):,}\n"
                         f"  • Tenure: {loan_details.get('tenure_months', 0)} months\n"
                         f"  • Monthly EMI: ₹{int(monthly_emi):,}\n"
                         f"  • Interest Rate: {loan_details.get('interest_rate', 0)}% p.a.\n"
                         f"  • Processing Fee: ₹{int(loan_details.get('processing_fee', 0)):,}\n\n"
-                        f"📄 **Your Sanction Letter:**\n"
-                        f"  Download from: {pdf_path}\n\n"
+                        f"📄 Your sanction letter is ready for download!\n"
                         f"💰 Funds will be disbursed within 24 hours.\n\n"
                         f"Welcome to QuickCash! 🚀"
                     )
@@ -745,7 +725,7 @@ class MasterAgent(BaseAgent):
                         "state": ConversationState.COMPLETED,
                         "next_action": "download",
                         "data": {
-                            "sanction_letter_path": pdf_path,
+                            "sanction_letter_path": san_out.get("pdf_path"),
                             "loan_details": loan_details,
                             "application_id": loan_details.get("application_id"),
                             "ocr_analysis": {
@@ -793,8 +773,6 @@ class MasterAgent(BaseAgent):
 
             except Exception as e:
                 print(f"❌ [Master Agent] Error processing document: {e}")
-                import traceback
-                traceback.print_exc()
                 return {
                     "message": (
                         f"❌ Sorry, there was an error processing your document: {str(e)}\n\n"
@@ -837,10 +815,8 @@ class MasterAgent(BaseAgent):
             san_out = flow.sanction_result or {}
             pdf_path = san_out.get("pdf_path")
             if pdf_path:
-                if not os.path.isabs(pdf_path):
-                    pdf_path = os.path.abspath(pdf_path)
                 return {
-                    "message": f"Here's your sanction letter! 📄\n\nDownload from: {pdf_path}",
+                    "message": "Here's your sanction letter! 📄",
                     "state": ConversationState.COMPLETED,
                     "next_action": "download",
                     "data": {"pdf_path": pdf_path}
@@ -921,25 +897,16 @@ class MasterAgent(BaseAgent):
 
             san_out = flow.sanction_result
             loan_details = uw_out.get("loan_details", {})
-            
-            # Get the PDF path and convert to absolute
-            pdf_path = san_out.get("pdf_path", "")
-            if pdf_path and not os.path.isabs(pdf_path):
-                pdf_path = os.path.abspath(pdf_path)
 
             response = (
                 f"🎉 **Congratulations! Your loan is APPROVED!**\n\n"
                 f"📋 **Loan Details:**\n"
-                f"  • Application ID: {loan_details.get('application_id', 'N/A')}\n"
                 f"  • Amount: ₹{int(loan_details.get('loan_amount', 0)):,}\n"
                 f"  • Tenure: {loan_details.get('tenure_months', 0)} months\n"
                 f"  • Monthly EMI: ₹{int(loan_details.get('monthly_emi', 0)):,}\n"
-                f"  • Interest Rate: {loan_details.get('interest_rate', 0)}% p.a.\n"
-                f"  • Processing Fee: ₹{int(loan_details.get('processing_fee', 0)):,}\n\n"
-                f"📄 **Your Sanction Letter:**\n"
-                f"  Download from: {pdf_path}\n\n"
-                f"💰 Funds will be disbursed within 24 hours.\n\n"
-                f"Thank you for choosing QuickCash! 🚀"
+                f"  • Interest Rate: {loan_details.get('interest_rate', 0)}% p.a.\n\n"
+                f"📄 Your sanction letter is ready for download!\n"
+                f"💰 Funds will be disbursed within 24 hours."
             )
 
             return {
@@ -948,7 +915,7 @@ class MasterAgent(BaseAgent):
                 "next_action": "download",
                 "data": {
                     "loan_details": loan_details,
-                    "sanction_letter_path": pdf_path,
+                    "sanction_letter_path": san_out.get("pdf_path"),
                     "application_id": loan_details.get("application_id")
                 },
                 "metadata": {
